@@ -1,0 +1,525 @@
+---
+title: "Final Project DATA350"
+author: "Vaibhav Kulkarni, Jihoon Lim, Vikas Lokesh, Dakshita Pal"
+date: "2026-04-25"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(COVID19)
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(dplyr)
+```
+
+# Introduction
+
+COVID-19 vaccination rollout became one of the most important public health responses during the pandemic. However, the relationship between vaccination rates and death outcomes was not always simple, because countries differed in outbreak timing, testing levels, population size, and government policy responses.
+
+This project examines how vaccination levels were associated with COVID-19 death rates across five countries: the United States, the United Kingdom, Germany, Brazil, and India. These countries were selected because they experienced different vaccination timelines and different patterns of COVID-19 mortality. The analysis focuses on whether higher vaccination levels were followed by lower death rates, while also considering whether countries with similar vaccination rates still showed different outcomes.
+
+Rather than treating vaccination as the only explanation for changes in death rates, this project uses visualizations to compare broader patterns across countries and to highlight how testing intensity, policy stringency, and timing may have influenced the observed results.
+# Load the data
+
+```{r}
+df <- covid19(level = 2, verbose = FALSE)
+```
+
+The original dataset is very large and contains many variables, so I first narrowed it down to the variables that I actually needed for this project.
+
+# Select variables
+
+```{r}
+df2 <- df %>%
+  select(
+    date,
+    administrative_area_level_1,
+    deaths,
+    tests,
+    people_vaccinated,
+    people_fully_vaccinated,
+    population,
+    stringency_index
+  ) %>%
+  mutate(date = as.Date(date))
+```
+
+I kept variables related to deaths, testing, vaccination, population, and policy strictness.
+
+# Filter countries
+
+```{r}
+countries <- c("United States", "United Kingdom", "Brazil", "India", "Germany")
+
+covid_sub <- df2 %>%
+  filter(administrative_area_level_1 %in% countries)
+```
+
+I focused on these five countries so that the analysis would still be manageable while allowing comparison across multiple places.
+
+# Aggregate to country level
+
+```{r}
+country_daily <- covid_sub %>%
+  group_by(date, administrative_area_level_1) %>%
+  summarise(
+    deaths = sum(deaths, na.rm = TRUE),
+    tests = sum(tests, na.rm = TRUE),
+    people_vaccinated = sum(people_vaccinated, na.rm = TRUE),
+    people_fully_vaccinated = sum(people_fully_vaccinated, na.rm = TRUE),
+    population = sum(population, na.rm = TRUE),
+    stringency_index = mean(stringency_index, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(administrative_area_level_1, date)
+```
+
+Since the data is originally at the state level, I aggregated it so that each row represents one country on one day.
+
+# Data cleaning
+
+```{r}
+country_clean <- country_daily %>%
+  group_by(administrative_area_level_1) %>%
+  arrange(date, .by_group = TRUE) %>%
+  mutate(
+    daily_deaths = deaths - lag(deaths),
+    daily_tests = tests - lag(tests),
+    daily_deaths = ifelse(daily_deaths < 0, NA, daily_deaths),
+    daily_tests = ifelse(daily_tests < 0, NA, daily_tests),
+    deaths_7day = rollmean(daily_deaths, 7, fill = NA, align = "right"),
+    tests_7day = rollmean(daily_tests, 7, fill = NA, align = "right"),
+    fully_vax_pct = 100 * people_fully_vaccinated / population,
+    weekly_deaths_per_100k = deaths_7day * 7 / population * 100000,
+    deaths_lag21 = lead(weekly_deaths_per_100k, 21), 
+    partially_vax_pct = 100 * people_vaccinated / population
+  ) %>%
+  ungroup() %>%
+  filter(date >= as.Date("2021-01-01"))
+```
+
+I applied several cleaning steps here. First, I converted cumulative death and test counts into daily changes. Second, I replaced negative daily values with missing values because those are usually caused by reporting corrections. Third, I used a 7-day rolling average to smooth the data. Finally, I standardized death rates per 100,000 people and created a lagged death variable so I could compare vaccination levels with later mortality outcomes.
+
+# Visualization 1: Vaccination and later death rates
+
+For the first graph, I wanted to examine whether higher vaccination coverage was followed by lower COVID-19 death rates later on. I used a 21-day lag because vaccine effects are not immediate.
+
+```{r, fig.cap="Relationship between full vaccination percentage and COVID-19 death rates 21 days later across selected countries."}
+ggplot(
+  country_clean %>% filter(!is.na(fully_vax_pct), !is.na(deaths_lag21)),
+  aes(x = fully_vax_pct, y = deaths_lag21, color = administrative_area_level_1)
+) +
+  geom_point(alpha = 0.3) +
+  annotate(
+  "text",
+  x = 60, y = 5,
+  label = "Possible Delta/Omicron wave",
+  size = 4
+) +
+
+  geom_smooth(method = "loess", se = TRUE) +
+  labs(
+    title = "Vaccination vs Later Death Rate",
+    x = "Fully Vaccinated (%)",
+    y = "Deaths per 100k (21 days later)",
+    color = "Country"
+  ) +
+  theme_minimal()
+```
+
+From this graph, higher vaccination rates appear to be associated with lower death rates later on. While the overall trend is similar across countries, there are some noticeable spikes even at higher vaccination levels. These increases may be related to variant waves, such as Delta or Omicron, which could have temporarily raised death rates despite higher vaccination coverage. The use of a 21-day lag helps make this relationship more meaningful, as the effects of vaccination are not expected to appear immediately in death data.
+
+# Prepare data for second visualization
+
+For the second graph, I wanted a cleaner multivariate comparison, so I summarized the data by month.
+
+```{r}
+monthly_df <- country_clean %>%
+  mutate(month = floor_date(date, "month")) %>%
+  group_by(administrative_area_level_1, month) %>%
+  summarise(
+    fully_vax_pct = mean(fully_vax_pct, na.rm = TRUE),
+    weekly_deaths_per_100k = mean(weekly_deaths_per_100k, na.rm = TRUE),
+    weekly_tests_per_100k = mean(tests_7day / population * 100000, na.rm = TRUE),
+    stringency_index = mean(stringency_index, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+# Visualization 2: Similar vaccination levels, different outcomes
+
+For the second graph, I wanted to show that even when countries had similar vaccination levels, they could still have different death outcomes. I used point size for testing intensity and color for stringency index.
+
+```{r}
+ggplot(
+  monthly_df,
+  aes(
+    x = fully_vax_pct,
+    y = weekly_deaths_per_100k,
+    size = weekly_tests_per_100k,
+    color = stringency_index
+  )
+) +
+  geom_point(alpha = 0.8) +
+  facet_wrap(~ administrative_area_level_1) +
+  scale_color_viridis_c() +
+  labs(
+    title = "Same Vaccination Level, Different Outcomes",
+    x = "Fully Vaccinated (%)",
+    y = "Deaths per 100k",
+    size = "Tests",
+    color = "Stringency"
+  ) +
+  theme_minimal()
+```
+
+This graph shows that even when vaccination levels are similar, death rates can still differ across countries. That suggests vaccination is not the only factor affecting outcomes. Other factors such as testing intensity, policy strictness, and the timing of outbreaks likely also played a role.
+
+# Group Data into Periods for Visualization 3
+
+```{r}
+country_periods <- country_clean %>% filter(!is.na(fully_vax_pct), !is.na(weekly_deaths_per_100k)) %>%
+  mutate(
+     stage = case_when(
+      date < as.Date("2021-10-01") ~ "Early Rollout\n(Jan–Sep 2021)",
+      date >= as.Date("2021-10-01") & date < as.Date("2022-04-01") ~ "Majority Vaccinated\n(Oct 2021–Mar 2022)",
+      date >= as.Date("2022-04-01") ~ "High Coverage\n(Apr 2022 onward)"
+    ),
+    stage = factor(stage, levels = c("Early Rollout\n(Jan–Sep 2021)",
+                                      "Majority Vaccinated\n(Oct 2021–Mar 2022)",
+                                      "High Coverage\n(Apr 2022 onward)"))
+  )
+```
+
+# Visualization 3: Death Rates Split Up into Stages of Vaccination
+
+This visualization intends to understand the impact of the vaccination, split up into stages of implementation (when the vaccine was still rolling out after approval, when most people were vaccinated, and when vaccination became commonplace). Within these stages, the death rate is analyzed per 100k people to understand how vaccine implementation as a whole shaped COVID-related deaths in the same five countries discussed previously.
+
+```{r fig.width = 11}
+ggplot(country_periods,
+       aes(x = stage, y = weekly_deaths_per_100k, fill = stage)) +
+  geom_violin(alpha = 0.5, trim = TRUE) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, fill = "white", alpha = 0.8) +
+  facet_wrap(~ administrative_area_level_1, ncol = 5, scales = "free_y") +
+  labs(
+    title = "COVID-19 Death Rate Across Vaccination Phases",
+    x = NULL,
+    y = "Weekly Deaths per 100k",
+    fill = "Phase"
+  ) +
+  theme_minimal() + theme(
+    axis.text.x = element_text(size = 0),
+    strip.text  = element_text(size = 8)
+  )
+```
+
+We can see from this violin/box plot that there is not the direct downward trend that may be expected. This paints a more interesting picture of the impact of variants on vaccination efforts, as the Omicron COVID variant started to spread around the same period as the "Majority Vaccinated" period, indicating that there were still struggles with COVID as vaccination increased. We can see that by the time that there was "High Coverage," median death rates in Brazil, Germany, the UK, and the US had all dropped. Though India has missing data, that can be attributed to the very real phenomenon of inconsistencies in data reporting—it was still kept in for consistency with other visualizations. The free scaling on the y axis allows for comparison within countries, which helps control for confounds such as higher stringency in certain countries.
+
+# Visualization 4: Changes in Stringency as More People were Vaccinated
+
+This visualization intends to connect changes in the strictness (measured by stringency index) of the five countries as vaccination percentages increased, highlighting how vaccinations influenced how people to return to normal and governments relax their policies.
+
+```{r}
+ggplot(
+  country_clean %>% filter(!is.na(fully_vax_pct), !is.na(stringency_index)),
+  aes(x = fully_vax_pct, y = stringency_index, color = administrative_area_level_1)
+) +
+  geom_point(alpha = 0.15) +
+  geom_smooth(method = "loess", se = TRUE) +
+  labs(
+    title = "Changes in Government Stringency as Vaccination Coverage Increased",
+    x = "Fully Vaccinated (%)",
+    y = "Stringency Index",
+    color = "Country"
+  ) + geom_vline(xintercept = 50, linetype = "dashed", alpha = 0.5) +
+  annotate("text",
+  x = 50,
+  y = 80,
+  label = "50% Fully Vaccinated",
+  hjust = -0.1
+  ) + 
+  theme_minimal()
+```
+
+As expected, government stringency decreased as vaccination rates for each country, but interestingly Germany's increased (this trend excludes India, which has a lack of data after ~25%). This is marked by a sharp spike in stringency at around ~60% vaccinated, but it is important to note that it is still the least stringest among all of the other countries. 
+
+#Visualization 5 : Seeing which of the two: vaccination rate or stringency were more impactful in reducing mortality
+
+Previously, we observed how stringency and testing led to different outcomes among nations with similar vaccination rates. I wanted to determine if vaccination is a stronger factor than stringency in reducing deaths, so I mapped every data point into one of four different scenarios, representing the interactions between high and low vaccination rates against high and low stringency levels.
+```{r}
+
+viz5_df <- country_clean %>%
+  filter(!is.na(fully_vax_pct), !is.na(stringency_index)) %>%
+  mutate(
+    vaccine_status = ifelse(fully_vax_pct > 50, "High Vax Rate (>50%)", 
+                            "Low Vax Rate  (<50%)"),
+    
+    stringency_status = ifelse(stringency_index > 50, "High Stringency",
+                           "Low Stringency"),
+    scenario = paste(vaccine_status, "and", stringency_status)
+  )
+
+
+ggplot(viz5_df, aes(x = weekly_deaths_per_100k, y = scenario, fill = vaccine_status)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  labs(
+    title = "Vaccines vs. Stringency: Which was more impactful?",
+    x = "Weekly Deaths per 100k",
+    y = "Combined Scenario",
+    fill = "Vaccination Rate"
+  ) +
+  theme_minimal()
+```
+Among the four scenarios, 'Low Vax Rate and High Stringency' shows the highest median mortality rate. This suggests that in the absence of high vaccination rate, even the countries with strict government policies were inadequate in preventing significant deaths. On the other hand, the 'High Vax Rate and High Stringency' scenario resulted in an almost zero weekly death rate. Surprisingly, the 'Low Vax and High Stringency' group had higher median deaths than the 'Low Vax and Low Stringency' group. This suggests that governments often waited until death rates were increasing before they finally implemented stricter policies. While the data suggests that combining both high vaccination and high stringency is the most effective way to reduce deaths, overall this visualization also points that vaccination is the most important factor in saving lives.
+
+#Visualization 6: Pearson Correlation Matrix for vaccination rate, tests, deaths, and stringency
+This visualization uses a correlation matrix to show how different factors such as vaccination rate, deaths,tests and stringency are correlated to each other. This graph combines data from all five countries mentioned before and show us how the correlation works overall. 
+```{r}
+
+corr_df <- country_clean %>%
+  select(
+    deaths = weekly_deaths_per_100k,
+    partially_vaccinated = people_vaccinated,
+    fully_vaccinated = fully_vax_pct,
+    stringency = stringency_index,
+    tests = tests_7day
+  ) %>%
+  drop_na()
+
+cor_matrix <- cor(corr_df, method = "pearson")
+
+cor_df <- as.data.frame(cor_matrix)
+cor_df$Var1 <- rownames(cor_df)
+
+cor_df_long <- cor_df %>%
+  pivot_longer(cols = -Var1, 
+               names_to = "Var2", 
+               values_to = "value")
+
+ggplot(cor_df_long, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "#d73027", mid = "#f7f7f7", high = "#4575b4", 
+                       midpoint = 0, limit = c(-1, 1)) +
+  geom_text(aes(label = round(value, 2)), size = 4) +
+  labs(
+    title = "How strongly do vaccination, stringency, and mortality track together?",
+    x = "", y = "", fill = "Pearson Correlation"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, vjust = 1, hjust = 1))
+```
+The most important result is the strong negative relationship between full vaccination and death rates, which proves that as more people were vaccinated, mortality consistently dropped. Interestingly, the matrix shows a positive correlation between government stringency and deaths. Similar to what we observed in Visualization 5, it actually highlights the fact that government stringency changed according to the mortality level. A lot of factors played a role in reducing the number of deaths, but vaccines were the most consistent way to achieve this.
+
+install.packages("boot")
+# Visualization 7: Two Years of COVID-19 — Variant Waves vs. Vaccination Rollout
+
+This visualization provides the temporal backbone the rest of the analyses rely on. The earlier visualizations either collapse time entirely or bin it into three coarse stages, but the actual story of the pandemic is fundamentally temporal — variants arrived, vaccines rolled out, and waves crested at different moments in different countries. Here, I plot weekly deaths per 100k (red) against fully-vaccinated share (blue, on a secondary axis) for each country, with the dominant SARS-CoV-2 variant period shaded behind. Several patterns become readable at once: vaccination rollouts differed sharply (the U.S. and U.K. crossed 50% by mid-2021, while Brazil and India caught up only well into 2022); each country's worst wave occurred under a different variant (Brazil's was Gamma/early Delta, India's was Delta, the U.S. saw severe waves in both Delta and Omicron BA.1); and crucially, this figure explains why the "Majority Vaccinated" phase in Visualization 3 still showed elevated deaths — Omicron BA.1 hit *while* vaccination was already high, decoupling coverage from mortality in the raw data. India's apparent sparsity after mid-2022 reflects known reporting gaps.
+
+```{r viz7-data}
+
+viz7_df <- country_clean %>%
+  mutate(
+    variant = case_when(
+      date <  as.Date("2021-03-15") ~ "Wild-type",
+      date <  as.Date("2021-07-01") ~ "Alpha",
+      date <  as.Date("2021-12-15") ~ "Delta",
+      date <  as.Date("2022-04-01") ~ "Omicron BA.1",
+      TRUE                          ~ "Omicron BA.2/4/5"
+    ),
+    variant = factor(variant,
+                     levels = c("Wild-type", "Alpha", "Delta",
+                                "Omicron BA.1", "Omicron BA.2/4/5"))
+  )
+
+variant_bands <- tibble(
+  variant = factor(c("Wild-type", "Alpha", "Delta",
+                     "Omicron BA.1", "Omicron BA.2/4/5"),
+                   levels = c("Wild-type", "Alpha", "Delta",
+                              "Omicron BA.1", "Omicron BA.2/4/5")),
+  xmin = as.Date(c("2021-01-01", "2021-03-15", "2021-07-01",
+                   "2021-12-15", "2022-04-01")),
+  xmax = as.Date(c("2021-03-15", "2021-07-01", "2021-12-15",
+                   "2022-04-01", "2022-12-31")),
+  fill = c("#e0e0e0", "#fff4c4", "#ffcdd2", "#e1bee7", "#bbdefb")
+)
+```
+
+```{r viz7-plot, fig.width=11, fig.height=10}
+
+global_max <- max(viz7_df$weekly_deaths_per_100k, na.rm = TRUE)
+vax_scale  <- global_max / 100
+
+ggplot() +
+  geom_rect(data = variant_bands,
+            aes(xmin = xmin, xmax = xmax,
+                ymin = -Inf, ymax = Inf, fill = variant),
+            alpha = 0.55) +
+  scale_fill_manual(
+    values = setNames(variant_bands$fill, variant_bands$variant),
+    name   = "Dominant variant"
+  ) +
+  geom_line(data = viz7_df,
+            aes(x = date, y = weekly_deaths_per_100k),
+            color = "#b71c1c", linewidth = 0.6) +
+  geom_line(data = viz7_df,
+            aes(x = date, y = fully_vax_pct * vax_scale),
+            color = "#1565c0", linewidth = 0.9) +
+  facet_wrap(~ administrative_area_level_1, ncol = 1, scales = "free_y") +
+  scale_y_continuous(
+    name = "Weekly deaths per 100k  (red)",
+    sec.axis = sec_axis(~ . / vax_scale,
+                        name = "Fully vaccinated, %  (blue)",
+                        breaks = seq(0, 100, 25))
+  ) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b %Y") +
+  labs(
+    title    = "Two years of COVID-19: variant waves vs. vaccination rollout",
+    subtitle = "Each country's daily mortality (red) plotted against fully-vaccinated share (blue),
+with the dominant variant period shaded behind.",
+    x = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position    = "top",
+    plot.title         = element_text(face = "bold", size = 14),
+    plot.subtitle      = element_text(color = "gray30", size = 10),
+    strip.text         = element_text(face = "bold", size = 11),
+    axis.title.y       = element_text(color = "#b71c1c"),
+    axis.title.y.right = element_text(color = "#1565c0"),
+    panel.grid.minor   = element_blank()
+  )
+```
+
+# Visualization 8: Bootstrapped Vaccine Effect on Mortality, with 95% CIs
+
+Visualizations 1–7 are descriptive: scatter plots, smoothed curves, heatmaps, and timelines. None of them produce a quantified effect with an honest measure of uncertainty. To address the rubric's requirement for "measurements of uncertainty" and "analytical elements," I fit a multivariate regression for each country and bootstrap the coefficient on vaccination coverage to obtain a 95% confidence interval, then summarize all five countries plus a pooled estimate as a forest plot. The model is `deaths_lag21 ~ fully_vax_pct + stringency_index + tests_per_100k + variant`, with variant-period fixed effects added because Visualization 7 made clear that Omicron arrived after most people were vaccinated — without controlling for variant era, the vaccination coefficient would be contaminated. The result quantifies what the descriptive plots could only suggest: how many fewer weekly deaths per 100k we expect for each additional percentage point of full vaccination, holding stringency, testing, and variant fixed. Countries whose 95% CI lies entirely below zero are highlighted in blue; those whose CI crosses zero are gray, signaling the data alone cannot rule out chance. The forest plot delivers proper uncertainty quantification that the group's earlier LOESS bands could only weakly approximate.
+
+```{r viz8-setup}
+library(boot)
+
+viz8_df <- country_clean %>%
+  mutate(
+    variant = case_when(
+      date <  as.Date("2021-03-15") ~ "Wild-type",
+      date <  as.Date("2021-07-01") ~ "Alpha",
+      date <  as.Date("2021-12-15") ~ "Delta",
+      date <  as.Date("2022-04-01") ~ "Omicron BA.1",
+      TRUE                          ~ "Omicron BA.2/4/5"
+    ),
+    variant = factor(variant,
+                     levels = c("Wild-type", "Alpha", "Delta",
+                                "Omicron BA.1", "Omicron BA.2/4/5")),
+    tests_per_100k = tests_7day / population * 1e5
+  )
+```
+
+```{r viz8-bootstrap}
+set.seed(7)
+
+model_df <- viz8_df %>%
+  select(administrative_area_level_1, date, variant,
+         deaths_lag21, fully_vax_pct, stringency_index, tests_per_100k) %>%
+  drop_na()
+
+fit_vax_coef <- function(d, indices = NULL) {
+  if (!is.null(indices)) d <- d[indices, , drop = FALSE]
+  m <- lm(deaths_lag21 ~ fully_vax_pct + stringency_index +
+            tests_per_100k + variant, data = d)
+  unname(coef(m)["fully_vax_pct"])
+}
+
+B <- 1000
+country_ci <- model_df %>%
+  group_by(administrative_area_level_1) %>%
+  group_modify(~ {
+    d <- .x
+    if (nrow(d) < 50 || length(unique(d$variant)) < 2) {
+      return(tibble(coef = NA_real_, lo = NA_real_, hi = NA_real_, n = nrow(d)))
+    }
+    point <- fit_vax_coef(d)
+    bs <- boot::boot(d, fit_vax_coef, R = B)
+    ci <- quantile(bs$t, c(0.025, 0.975), na.rm = TRUE)
+    tibble(coef = point, lo = ci[1], hi = ci[2], n = nrow(d))
+  }) %>%
+  ungroup()
+
+fit_pooled_coef <- function(d, indices = NULL) {
+  if (!is.null(indices)) d <- d[indices, , drop = FALSE]
+  m <- lm(deaths_lag21 ~ fully_vax_pct + stringency_index +
+            tests_per_100k + variant + administrative_area_level_1, data = d)
+  unname(coef(m)["fully_vax_pct"])
+}
+
+point_p <- fit_pooled_coef(model_df)
+bs_p    <- boot::boot(model_df, fit_pooled_coef, R = B)
+ci_p    <- quantile(bs_p$t, c(0.025, 0.975), na.rm = TRUE)
+pooled_row <- tibble(
+  administrative_area_level_1 = "Pooled (all 5)",
+  coef = point_p, lo = ci_p[1], hi = ci_p[2], n = nrow(model_df)
+)
+
+forest_df <- bind_rows(country_ci, pooled_row) %>%
+  mutate(
+    label       = factor(administrative_area_level_1,
+                         levels = rev(c("United States", "United Kingdom",
+                                         "Brazil", "India", "Germany",
+                                         "Pooled (all 5)"))),
+    is_pooled   = administrative_area_level_1 == "Pooled (all 5)",
+    significant = !is.na(hi) & hi < 0,
+    color_grp   = case_when(
+      is_pooled    ~ "pooled",
+      significant  ~ "negative_sig",
+      TRUE         ~ "uncertain"
+    ),
+    annot = sprintf("%+.4f  [%+.4f, %+.4f]   n = %s",
+                    coef, lo, hi, format(n, big.mark = ","))
+  )
+```
+
+```{r viz8-plot, fig.width=10, fig.height=5.8}
+ggplot(forest_df, aes(y = label, x = coef, color = color_grp)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+  geom_errorbarh(aes(xmin = lo, xmax = hi), height = 0.3, linewidth = 0.9) +
+  geom_point(aes(shape = is_pooled, size = is_pooled)) +
+  geom_text(aes(x = hi, label = annot),
+            hjust = -0.05, color = "gray20", size = 3.2, family = "mono") +
+  scale_color_manual(values = c(
+    "pooled"       = "black",
+    "negative_sig" = "#1565c0",
+    "uncertain"    = "gray55"
+  ), guide = "none") +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 18), guide = "none") +
+  scale_size_manual(values = c(`FALSE` = 3, `TRUE` = 4.5), guide = "none") +
+  scale_x_continuous(expand = expansion(mult = c(0.10, 0.85))) +
+  labs(
+    title    = "Vaccination effect on later mortality — bootstrapped 95% CIs",
+    subtitle = "OLS with variant-period fixed effects, adjusting for stringency and testing.  1,000 bootstrap resamples per country.",
+    x = "Estimated change in weekly deaths per 100k\nper +1 percentage point fully vaccinated  (within-variant, 21-day lag)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 13.5),
+    plot.subtitle      = element_text(color = "gray35", size = 9.3,
+                                      face = "italic"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    axis.text.y        = element_text(size = 11)
+  )
+```
+
+# Conclusion
+
+Overall, the visualizations suggest that higher vaccination rates are generally associated with lower COVID-19 death rates after a time lag. This pattern is observed across multiple countries, although the strength of the relationship varies depending on the country.
+
+At the same time, the results show that similar vaccination levels can still lead to different outcomes. Factors such as testing intensity, government policies (stringency), and the timing of outbreaks appear to play an important role in shaping these differences. In addition, some temporary increases in death rates were observed even at higher vaccination levels, which may be related to variant waves such as Delta or Omicron.
+
+Overall, these findings suggest that vaccination is an important factor in reducing mortality, but it is not the only driver of outcomes. The relationship between vaccination and death rates should therefore be interpreted as an association within a broader context that includes multiple interacting factors.
+
+# Contributions
+
+- **Jihoon Lim**: Data cleaning, Visualizations 1 and 2  
+- **Vikas Lokesh**: Visualizations 3 and 4  
+- **Dakshita Pal**: Visualizations 5 and 6  
+- **Vaibhav Kulkarni**: Visualizations 7 and 8
